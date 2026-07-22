@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebRTC Signaling Client</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Arial; max-width: 900px; margin: 24px; }
+    textarea { width: 100%; height: 6rem; }
+    label { display:block; margin-top: 8px; }
+    button { margin: 6px 4px; }
+    .box { padding: 12px; border: 1px solid #ddd; border-radius: 6px; margin-top: 12px }
+  </style>
+</head>
+<body>
+  <h1>mic-2026 — Signaling Client</h1>
+  <div class="box">
+    <label>My name: <input id="name" value="Singer"></label>
+    <label>Role: 
+      <select id="role">
+        <option value="sender">Sender (publish mic)</option>
+        <option value="receiver">Receiver (listen)</option>
+      </select>
+    </label>
+    <label>Peer ID (optional — server will return one when creating an offer): <input id="peerId"></label>
+    <div>
+      <button id="start">Start / Create Offer (sender)</button>
+      <button id="list">List Offers (receiver)</button>
+      <button id="answer">Answer Selected Offer</button>
+      <button id="leave">Leave / Delete Peer</button>
+    </div>
+  </div>
+
+  <div class="box">
+    <h3>Offers</h3>
+    <select id="offers" size="6" style="width:100%"></select>
+  </div>
+
+  <div class="box">
+    <h3>Logs</h3>
+    <pre id="log" style="height:240px; overflow:auto; background:#fafafa"></pre>
+  </div>
+
+  <audio id="remoteAudio" autoplay playsinline></audio>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(...args) { console.log(...args); logEl.textContent += args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+    const roleSel = document.getElementById('role');
+    const nameInput = document.getElementById('name');
+    const peerIdInput = document.getElementById('peerId');
+    const offersSelect = document.getElementById('offers');
+
+    let pc = null;
+    let localStream = null;
+    let pollCandidatesInterval = null;
+
+    function api(path, opts={}){
+      return fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts)).then(async r=>{
+        const text = await r.text();
+        try { return JSON.parse(text || '{}'); } catch(e){ return text; }
+      });
+    }
+
+    async function startAsSender(){
+      try{
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }catch(e){ log('getUserMedia failed', e); return; }
+
+      pc = new RTCPeerConnection();
+      pc.onicecandidate = e => { if (e.candidate) sendCandidate(e.candidate); };
+      pc.ontrack = e => { log('remote track', e); document.getElementById('remoteAudio').srcObject = e.streams[0]; };
+
+      for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const payload = { sdp: offer.sdp, name: nameInput.value || 'Singer', peerId: peerIdInput.value || undefined };
+      const resp = await api('/signal/offer', { method: 'POST', body: JSON.stringify(payload) });
+      if (resp && resp.peerId) {
+        peerIdInput.value = resp.peerId;
+        log('Created offer, peerId', resp.peerId);
+        pollForAnswer(resp.peerId);
+        startPollingCandidates(resp.peerId);
+      } else {
+        log('Offer response', resp);
+      }
+    }
+
+    async function pollForAnswer(peerId){
+      log('Polling for answer for', peerId);
+      const id = peerId;
+      const check = async ()=>{
+        const r = await api('/signal/answer/' + id);
+        if (r && r.sdp) {
+          log('Got answer');
+          await pc.setRemoteDescription({ type: 'answer', sdp: r.sdp });
+          clearInterval(tid);
+        }
+      };
+      const tid = setInterval(check, 1500);
+      check();
+    }
+
+    async function sendCandidate(candidate){
+      const peerId = peerIdInput.value;
+      if (!peerId) return;
+      const payload = { peerId, candidate, from: roleSel.value === 'sender' ? 'sender' : 'receiver' };
+      await api('/signal/candidate', { method: 'POST', body: JSON.stringify(payload) });
+      log('Sent ICE candidate', payload.from);
+    }
+
+    function startPollingCandidates(peerId){
+      if (pollCandidatesInterval) clearInterval(pollCandidatesInterval);
+      pollCandidatesInterval = setInterval(async ()=>{
+        const from = roleSel.value === 'sender' ? 'sender' : 'receiver';
+        const r = await api('/signal/candidates/' + peerId + '?from=' + from);
+        if (r && Array.isArray(r.candidates) && r.candidates.length) {
+          log('Received', r.candidates.length, 'candidates from server for', from);
+          for (const c of r.candidates){
+            try{ await pc.addIceCandidate(c); } catch(e){ log('addIceCandidate failed', e); }
+          }
+        }
+      }, 1500);
+    }
+
+    async function listOffers(){
+      const r = await api('/signal/offers');
+      offersSelect.innerHTML = '';
+      (r.offers || []).forEach(o=>{
+        const opt = document.createElement('option');
+        opt.value = o.peerId;
+        opt.textContent = `${o.name || 'peer'} — ${o.peerId}`;
+        opt.dataset.sdp = o.sdp;
+        offersSelect.appendChild(opt);
+      });
+      log('Offers refreshed', (r.offers||[]).length);
+    }
+
+    async function answerSelected(){
+      const opt = offersSelect.selectedOptions[0];
+      if (!opt) { log('Select an offer first'); return; }
+      const peerId = opt.value;
+      const sdp = opt.dataset.sdp;
+
+      pc = new RTCPeerConnection();
+      pc.onicecandidate = e => { if (e.candidate) sendCandidate(e.candidate); };
+      pc.ontrack = e => { log('remote track', e); document.getElementById('remoteAudio').srcObject = e.streams[0]; };
+
+      // Optionally capture local mic if receiver also wants to send audio
+      try{ localStream = await navigator.mediaDevices.getUserMedia({ audio: true }); for (const t of localStream.getTracks()) pc.addTrack(t, localStream); }catch(e){ log('no local mic', e); }
+
+      await pc.setRemoteDescription({ type: 'offer', sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      await api('/signal/answer', { method: 'POST', body: JSON.stringify({ peerId, sdp: answer.sdp }) });
+      peerIdInput.value = peerId;
+      log('Sent answer for', peerId);
+
+      startPollingCandidates(peerId);
+    }
+
+    async function leave(){
+      const peerId = peerIdInput.value;
+      if (!peerId) return log('No peerId to leave');
+      await api('/signal/leave', { method: 'POST', body: JSON.stringify({ peerId }) });
+      log('Left', peerId);
+      peerIdInput.value='';
+      if (pc) { pc.close(); pc = null; }
+      if (pollCandidatesInterval) { clearInterval(pollCandidatesInterval); pollCandidatesInterval = null; }
+    }
+
+    document.getElementById('start').addEventListener('click', async ()=>{
+      if (roleSel.value === 'sender') await startAsSender();
+      else log('Start is for sender; use List Offers / Answer for receiver');
+    });
+    document.getElementById('list').addEventListener('click', listOffers);
+    document.getElementById('answer').addEventListener('click', answerSelected);
+    document.getElementById('leave').addEventListener('click', leave);
+
+    // refresh offers every 3s while on receiver
+    setInterval(()=>{ if (roleSel.value === 'receiver') listOffers(); }, 3000);
+
+    log('Client ready');
+  </script>
+</body>
+</html>
